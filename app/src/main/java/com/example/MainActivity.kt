@@ -1,5 +1,7 @@
 package com.example
 
+import android.app.Application
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -22,6 +24,9 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.foundation.Image
 import androidx.compose.runtime.*
@@ -33,8 +38,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.theme.MyApplicationTheme
@@ -43,8 +50,17 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -137,11 +153,11 @@ data class ChatMessage(
     val imagePath: String? = null
 )
 
-class ChatViewModel : ViewModel() {
+class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _messages = MutableStateFlow<List<ChatMessage>>(
         listOf(
             ChatMessage(
-                text = "Hello! I am your offline file manager agent. I can list, read, write, move, and delete files based on simple commands. How can I help you organize your device today?\n\nExamples:\n- \"List files in Download\"\n- \"Write 'hello' to Download/test.txt\"\n- \"Delete Download/test.txt\"\n- \"Move Download/test.txt to Download/Docs/test.txt\"",
+                text = "Hello! I am your file manager agent. I can list, read, write, move, and delete files based on simple commands. How can I help you organize your device today?\n\nExamples:\n- \"List files in Download\"\n- \"Write 'hello' to Download/test.txt\"\n- \"Delete Download/test.txt\"\n- \"Move Download/test.txt to Download/Docs/test.txt\"",
                 isUser = false
             )
         )
@@ -150,10 +166,122 @@ class ChatViewModel : ViewModel() {
 
     private val rootPath = Environment.getExternalStorageDirectory().absolutePath
 
+    // --- Online Mode settings, persisted locally on-device only ---
+    private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    private val _onlineModeEnabled = MutableStateFlow(prefs.getBoolean(KEY_ONLINE_MODE, false))
+    val onlineModeEnabled: StateFlow<Boolean> = _onlineModeEnabled.asStateFlow()
+
+    private val _apiKey = MutableStateFlow(prefs.getString(KEY_API_KEY, "") ?: "")
+    val apiKey: StateFlow<String> = _apiKey.asStateFlow()
+
+    private val _selectedModel = MutableStateFlow(prefs.getString(KEY_MODEL, DEFAULT_MODEL) ?: DEFAULT_MODEL)
+    val selectedModel: StateFlow<String> = _selectedModel.asStateFlow()
+
+    fun setOnlineMode(enabled: Boolean) {
+        _onlineModeEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_ONLINE_MODE, enabled).apply()
+    }
+
+    fun setApiKey(key: String) {
+        _apiKey.value = key
+        prefs.edit().putString(KEY_API_KEY, key).apply()
+    }
+
+    fun setModel(model: String) {
+        val value = model.ifBlank { DEFAULT_MODEL }
+        _selectedModel.value = value
+        prefs.edit().putString(KEY_MODEL, value).apply()
+    }
+
     fun sendMessage(text: String) {
         val userMsg = ChatMessage(text = text, isUser = true)
         _messages.value = _messages.value + userMsg
-        processCommand(text)
+        if (_onlineModeEnabled.value && _apiKey.value.isNotBlank()) {
+            processCommandOnline(text)
+        } else {
+            processCommand(text)
+        }
+    }
+
+    // --- Online Mode: route the command through OpenRouter, fall back offline on any failure ---
+    private fun processCommandOnline(text: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val raw = callOpenRouter(text)
+                withContext(Dispatchers.Main) { dispatchOnlineAction(raw, text) }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    addBotMessage("Online request failed (${e.message ?: "unknown error"}). Falling back to offline parsing.")
+                    processCommand(text)
+                }
+            }
+        }
+    }
+
+    private fun callOpenRouter(userText: String): String {
+        val payload = JSONObject().apply {
+            put("model", _selectedModel.value)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply { put("role", "system"); put("content", SYSTEM_PROMPT) })
+                put(JSONObject().apply { put("role", "user"); put("content", userText) })
+            })
+        }
+        val body = payload.toString().toRequestBody("application/json".toMediaType())
+        val request = Request.Builder()
+            .url("https://openrouter.ai/api/v1/chat/completions")
+            .addHeader("Authorization", "Bearer ${_apiKey.value}")
+            .addHeader("Content-Type", "application/json")
+            .post(body)
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("HTTP ${response.code}")
+            }
+            val bodyStr = response.body?.string() ?: throw IOException("Empty response")
+            val json = JSONObject(bodyStr)
+            val choices = json.optJSONArray("choices") ?: throw IOException("No choices in response")
+            if (choices.length() == 0) throw IOException("No choices in response")
+            return choices.getJSONObject(0).getJSONObject("message").getString("content")
+        }
+    }
+
+    private fun dispatchOnlineAction(rawResponse: String, originalInput: String) {
+        try {
+            val cleaned = rawResponse.trim()
+                .removePrefix("```json").removePrefix("```")
+                .removeSuffix("```").trim()
+            val obj = JSONObject(cleaned)
+            when (obj.optString("action")) {
+                "chat" -> addBotMessage(obj.optString("reply", "OK."))
+                "list" -> executeList(obj.optString("target", ""))
+                "read" -> executeRead(obj.optString("target", ""))
+                "preview" -> executePreview(obj.optString("target", ""))
+                "search" -> executeSearch(obj.optString("target", ""))
+                "delete" -> {
+                    val file = resolveFile(obj.optString("target", ""))
+                    addBotMessage("Are you sure you want to delete '${file.absolutePath}'?", PendingAction.ConfirmDelete(file.absolutePath))
+                }
+                "write" -> {
+                    val file = resolveFile(obj.optString("target", ""))
+                    addBotMessage("Are you sure you want to write to '${file.absolutePath}'?", PendingAction.ConfirmWrite(file.absolutePath, obj.optString("content", "")))
+                }
+                "move" -> {
+                    val source = resolveFile(obj.optString("target", ""))
+                    val dest = resolveFile(obj.optString("dest", ""))
+                    addBotMessage("Are you sure you want to move '${source.absolutePath}' to '${dest.absolutePath}'?", PendingAction.ConfirmMove(source.absolutePath, dest.absolutePath))
+                }
+                else -> processCommand(originalInput)
+            }
+        } catch (e: Exception) {
+            addBotMessage("Couldn't parse the online response. Falling back to offline parsing.")
+            processCommand(originalInput)
+        }
     }
 
     private fun resolveFile(path: String): File {
@@ -191,31 +319,14 @@ class ChatViewModel : ViewModel() {
             // List Logic
             if (lower.contains("list") || lower.contains("show") || lower.contains("dir")) {
                 val target = quotes.firstOrNull() ?: words.find { it.contains("/") && !it.contains("list") } ?: ""
-                val dir = if (target.isBlank()) File(rootPath) else resolveFile(target)
-                if (dir.exists() && dir.isDirectory) {
-                    val files = dir.listFiles()
-                    val listStr = files?.joinToString("\n") { (if (it.isDirectory) "📁 " else "📄 ") + it.name } ?: "Empty or cannot read."
-                    addBotMessage("Contents of ${dir.absolutePath}:\n$listStr")
-                } else {
-                    addBotMessage("Directory '${dir.absolutePath}' not found.")
-                }
+                executeList(target)
                 return
             }
 
             // Read Logic
             if (lower.contains("read") || lower.contains("cat")) {
                 val target = quotes.firstOrNull() ?: words.find { it.contains("/") || it.contains(".") } ?: lastWord
-                val file = resolveFile(target)
-                if (file.exists() && file.isFile) {
-                    try {
-                        val content = file.readText().take(2000) // limit output to 2k chars
-                        addBotMessage("Content of ${file.name}:\n$content")
-                    } catch (e: Exception) {
-                        addBotMessage("Error reading file: ${e.message}")
-                    }
-                } else {
-                    addBotMessage("File '${file.absolutePath}' not found.")
-                }
+                executeRead(target)
                 return
             }
 
@@ -269,12 +380,7 @@ class ChatViewModel : ViewModel() {
             if (lower.startsWith("search") || lower.startsWith("find")) {
                 val query = quotes.firstOrNull() ?: words.drop(1).joinToString(" ").trim()
                 if (query.isNotBlank()) {
-                    addBotMessage("Searching for '$query'...")
-                    viewModelScope.launch(Dispatchers.IO) {
-                        val results = performSearch(rootPath, query)
-                        val resultStr = if (results.isEmpty()) "No results found." else results.joinToString("\n") { it.absolutePath }
-                        addBotMessage("Search results:\n$resultStr")
-                    }
+                    executeSearch(query)
                     return
                 }
             }
@@ -282,26 +388,11 @@ class ChatViewModel : ViewModel() {
             // Preview Logic
             if (lower.startsWith("preview")) {
                 val target = quotes.firstOrNull() ?: words.find { it.contains("/") || it.contains(".") } ?: lastWord
-                val file = resolveFile(target)
-                if (file.exists() && file.isFile) {
-                    val ext = file.extension.lowercase()
-                    if (ext in listOf("jpg", "jpeg", "png", "gif", "webp", "bmp")) {
-                        addBotMessage("Previewing image ${file.name}:", imagePath = file.absolutePath)
-                    } else {
-                        try {
-                            val content = file.readText().take(2000)
-                            addBotMessage("Preview of ${file.name}:\n$content")
-                        } catch (e: Exception) {
-                            addBotMessage("Error reading file: ${e.message}")
-                        }
-                    }
-                } else {
-                    addBotMessage("File '${file.absolutePath}' not found.")
-                }
+                executePreview(target)
                 return
             }
 
-            addBotMessage("I didn't quite understand that. To ensure offline capabilities, I use a fast rule-based parser. Try commands like:\n- List files in 'Download'\n- Read 'Download/note.txt'\n- Delete 'Download/old_folder'\n- Write 'hello' to 'Download/note.txt'\n- Move 'Download/A.txt' to 'Download/B.txt'\n- Preview 'Download/image.png'\n- Search for 'query'\n- Create template 'name' from 'path'\n- Use template 'name' at 'path'")
+            addBotMessage("I didn't quite understand that. ${if (_onlineModeEnabled.value) "Online Mode is on but couldn't map that to an action." else "To ensure offline capabilities, I use a fast rule-based parser."} Try commands like:\n- List files in 'Download'\n- Read 'Download/note.txt'\n- Delete 'Download/old_folder'\n- Write 'hello' to 'Download/note.txt'\n- Move 'Download/A.txt' to 'Download/B.txt'\n- Preview 'Download/image.png'\n- Search for 'query'\n- Create template 'name' from 'path'\n- Use template 'name' at 'path'")
         } catch (e: Exception) {
             addBotMessage("Failed to parse or execute command: ${e.message}")
         }
@@ -383,6 +474,84 @@ class ChatViewModel : ViewModel() {
         _messages.value = _messages.value + ChatMessage(text = text, isUser = false, action = action, imagePath = imagePath)
     }
 
+    // Shared by both the offline rule-based parser and Online Mode's action dispatcher
+    private fun executeList(targetRaw: String) {
+        val dir = if (targetRaw.isBlank()) File(rootPath) else resolveFile(targetRaw)
+        if (dir.exists() && dir.isDirectory) {
+            val files = dir.listFiles()
+            val listStr = files?.joinToString("\n") { (if (it.isDirectory) "📁 " else "📄 ") + it.name } ?: "Empty or cannot read."
+            addBotMessage("Contents of ${dir.absolutePath}:\n$listStr")
+        } else {
+            addBotMessage("Directory '${dir.absolutePath}' not found.")
+        }
+    }
+
+    private fun executeRead(targetRaw: String) {
+        val file = resolveFile(targetRaw)
+        if (file.exists() && file.isFile) {
+            try {
+                val content = file.readText().take(2000)
+                addBotMessage("Content of ${file.name}:\n$content")
+            } catch (e: Exception) {
+                addBotMessage("Error reading file: ${e.message}")
+            }
+        } else {
+            addBotMessage("File '${file.absolutePath}' not found.")
+        }
+    }
+
+    private fun executePreview(targetRaw: String) {
+        val file = resolveFile(targetRaw)
+        if (file.exists() && file.isFile) {
+            val ext = file.extension.lowercase()
+            if (ext in listOf("jpg", "jpeg", "png", "gif", "webp", "bmp")) {
+                addBotMessage("Previewing image ${file.name}:", imagePath = file.absolutePath)
+            } else {
+                try {
+                    val content = file.readText().take(2000)
+                    addBotMessage("Preview of ${file.name}:\n$content")
+                } catch (e: Exception) {
+                    addBotMessage("Error reading file: ${e.message}")
+                }
+            }
+        } else {
+            addBotMessage("File '${file.absolutePath}' not found.")
+        }
+    }
+
+    private fun executeSearch(query: String) {
+        if (query.isBlank()) {
+            addBotMessage("Please specify a search query.")
+            return
+        }
+        addBotMessage("Searching for '$query'...")
+        viewModelScope.launch(Dispatchers.IO) {
+            val results = performSearch(rootPath, query)
+            val resultStr = if (results.isEmpty()) "No results found." else results.joinToString("\n") { it.absolutePath }
+            addBotMessage("Search results:\n$resultStr")
+        }
+    }
+
+    companion object {
+        private const val PREFS_NAME = "fileflow_prefs"
+        private const val KEY_ONLINE_MODE = "online_mode_enabled"
+        private const val KEY_API_KEY = "openrouter_api_key"
+        private const val KEY_MODEL = "openrouter_model"
+        const val DEFAULT_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+
+        private val SYSTEM_PROMPT = """
+            You are the command interpreter for an Android file manager agent. Given a user's natural language request, decide which single action to take and reply with ONLY a raw JSON object — no markdown, no code fences, no explanation, nothing before or after it. Schema:
+
+            {"action": "list" | "read" | "delete" | "write" | "move" | "search" | "preview" | "chat", "target": "<path, relative to device storage root unless it starts with />", "content": "<only for write>", "dest": "<only for move, destination path>", "reply": "<only for chat, a short conversational reply>"}
+
+            Rules:
+            - Use "chat" only when the request is not a file operation (greetings, questions about your capabilities, etc). Leave other fields empty in that case.
+            - Never invent file contents for read/list/search/preview — leave "content" empty for those actions.
+            - "target" and "dest" should be plain relative paths like "Download/notes.txt" unless the user gave an absolute path.
+            - Respond with the JSON object and nothing else.
+        """.trimIndent()
+    }
+
     private fun performSearch(dirPath: String, query: String): List<File> {
         val results = mutableListOf<File>()
         val dir = File(dirPath)
@@ -410,13 +579,33 @@ class ChatViewModel : ViewModel() {
 @Composable
 fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
     val messages by viewModel.messages.collectAsState()
+    val onlineModeEnabled by viewModel.onlineModeEnabled.collectAsState()
+    val apiKey by viewModel.apiKey.collectAsState()
     var inputText by remember { mutableStateOf("") }
+    var showSettingsDialog by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
+
+    if (showSettingsDialog) {
+        SettingsDialog(viewModel = viewModel, onDismiss = { showSettingsDialog = false })
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Local File Agent") },
+                title = {
+                    Column {
+                        Text("Local File Agent")
+                        Text(
+                            text = if (onlineModeEnabled && apiKey.isNotBlank()) "Online" else "Offline",
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { showSettingsDialog = true }) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                     titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
@@ -491,6 +680,89 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
             }
         }
     }
+}
+
+@Composable
+fun SettingsDialog(viewModel: ChatViewModel, onDismiss: () -> Unit) {
+    val onlineModeEnabled by viewModel.onlineModeEnabled.collectAsState()
+    val savedApiKey by viewModel.apiKey.collectAsState()
+    val savedModel by viewModel.selectedModel.collectAsState()
+
+    var enabled by remember { mutableStateOf(onlineModeEnabled) }
+    var keyInput by remember { mutableStateOf(savedApiKey) }
+    var modelInput by remember { mutableStateOf(savedModel) }
+    var showKey by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Online Mode") },
+        text = {
+            Column {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Route commands through OpenRouter")
+                    Switch(checked = enabled, onCheckedChange = { enabled = it })
+                }
+
+                if (enabled) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = "Requires an OpenRouter API key. Get one at openrouter.ai/keys.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = keyInput,
+                        onValueChange = { keyInput = it },
+                        label = { Text("OpenRouter API key") },
+                        singleLine = true,
+                        visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showKey = !showKey }) {
+                                Icon(
+                                    if (showKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                    contentDescription = if (showKey) "Hide key" else "Show key"
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = modelInput,
+                        onValueChange = { modelInput = it },
+                        label = { Text("Model") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (keyInput.isBlank()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Add your API key above to use Online Mode. Offline parsing is used until one is set.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                viewModel.setOnlineMode(enabled)
+                viewModel.setApiKey(keyInput.trim())
+                viewModel.setModel(modelInput.trim())
+                onDismiss()
+            }) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 @Composable
