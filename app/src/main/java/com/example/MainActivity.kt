@@ -143,7 +143,10 @@ sealed class PendingAction {
     data class ConfirmWrite(val path: String, val content: String) : PendingAction()
     data class ConfirmMove(val source: String, val dest: String) : PendingAction()
     data class ConfirmUseTemplate(val templateName: String, val destPath: String) : PendingAction()
+    data class ConfirmOrganize(val moves: List<OrganizeMove>) : PendingAction()
 }
+
+data class OrganizeMove(val from: String, val to: String)
 
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
@@ -263,6 +266,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 "read" -> executeRead(obj.optString("target", ""))
                 "preview" -> executePreview(obj.optString("target", ""))
                 "search" -> executeSearch(obj.optString("target", ""))
+                "organize" -> executeOrganize(obj.optString("target", ""))
                 "delete" -> {
                     val file = resolveFile(obj.optString("target", ""))
                     addBotMessage("Are you sure you want to delete '${file.absolutePath}'?", PendingAction.ConfirmDelete(file.absolutePath))
@@ -376,6 +380,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
+            // Organize Logic (requires Online Mode - see executeOrganize)
+            if (lower.contains("organize") || lower.contains("organise") || lower.contains("tidy")) {
+                val target = quotes.firstOrNull() ?: words.find { it.contains("/") } ?: ""
+                executeOrganize(target)
+                return
+            }
+
             // Search Logic
             if (lower.startsWith("search") || lower.startsWith("find")) {
                 val query = quotes.firstOrNull() ?: words.drop(1).joinToString(" ").trim()
@@ -392,7 +403,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
-            addBotMessage("I didn't quite understand that. ${if (_onlineModeEnabled.value) "Online Mode is on but couldn't map that to an action." else "To ensure offline capabilities, I use a fast rule-based parser."} Try commands like:\n- List files in 'Download'\n- Read 'Download/note.txt'\n- Delete 'Download/old_folder'\n- Write 'hello' to 'Download/note.txt'\n- Move 'Download/A.txt' to 'Download/B.txt'\n- Preview 'Download/image.png'\n- Search for 'query'\n- Create template 'name' from 'path'\n- Use template 'name' at 'path'")
+            addBotMessage("I didn't quite understand that. ${if (_onlineModeEnabled.value) "Online Mode is on but couldn't map that to an action." else "To ensure offline capabilities, I use a fast rule-based parser."} Try commands like:\n- List files in 'Download'\n- Read 'Download/note.txt'\n- Delete 'Download/old_folder'\n- Write 'hello' to 'Download/note.txt'\n- Move 'Download/A.txt' to 'Download/B.txt'\n- Preview 'Download/image.png'\n- Search for 'query'\n- Organize 'Download' (needs Online Mode)\n- Create template 'name' from 'path'\n- Use template 'name' at 'path'")
         } catch (e: Exception) {
             addBotMessage("Failed to parse or execute command: ${e.message}")
         }
@@ -460,6 +471,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (e: Exception) {
                     addBotMessage("Failed to apply template: ${e.message}")
                 }
+            }
+            is PendingAction.ConfirmOrganize -> {
+                var successCount = 0
+                val failures = mutableListOf<String>()
+                for (move in action.moves) {
+                    try {
+                        val source = File(move.from)
+                        val dest = File(move.to)
+                        if (!source.exists()) {
+                            failures.add(source.name)
+                            continue
+                        }
+                        dest.parentFile?.mkdirs()
+                        if (!source.renameTo(dest)) {
+                            source.copyRecursively(dest, overwrite = true)
+                            source.deleteRecursively()
+                        }
+                        successCount++
+                    } catch (e: Exception) {
+                        failures.add(File(move.from).name)
+                    }
+                }
+                val summary = StringBuilder("Organized $successCount item(s).")
+                if (failures.isNotEmpty()) summary.append("\nFailed to move: ${failures.joinToString(", ")}")
+                addBotMessage(summary.toString())
             }
         }
         
@@ -532,6 +568,88 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // AI decides the organization scheme, so this only works in Online Mode.
+    private fun executeOrganize(targetRaw: String) {
+        if (!(_onlineModeEnabled.value && _apiKey.value.isNotBlank())) {
+            addBotMessage("Organizing needs Online Mode, since it's the AI that decides how to group things. Enable it and add an OpenRouter API key in Settings, then try again.")
+            return
+        }
+        val dir = if (targetRaw.isBlank()) File(rootPath) else resolveFile(targetRaw)
+        if (!dir.exists() || !dir.isDirectory) {
+            addBotMessage("Directory '${dir.absolutePath}' not found.")
+            return
+        }
+        addBotMessage("Looking at '${dir.absolutePath}' to plan an organization...")
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val entries = dir.listFiles()?.map { it.name + if (it.isDirectory) "/" else "" } ?: emptyList()
+                if (entries.isEmpty()) {
+                    withContext(Dispatchers.Main) { addBotMessage("That folder is empty - nothing to organize.") }
+                    return@launch
+                }
+                val relativeMoves = requestOrganizePlan(dir.absolutePath, entries)
+                // Validate against what's actually on disk, in case the model named something that doesn't exist.
+                val moves = relativeMoves.mapNotNull { (relFrom, relTo) ->
+                    val fromFile = File(dir, relFrom)
+                    if (!fromFile.exists()) return@mapNotNull null
+                    val toFile = File(dir, relTo)
+                    OrganizeMove(fromFile.absolutePath, toFile.absolutePath)
+                }
+                withContext(Dispatchers.Main) {
+                    if (moves.isEmpty()) {
+                        addBotMessage("The organizer didn't suggest any changes - looks tidy already.")
+                    } else {
+                        val preview = moves.joinToString("\n") { "${File(it.from).name} -> ${it.to.removePrefix(dir.absolutePath + "/")}" }
+                        addBotMessage(
+                            "Here's a suggested organization for '${dir.absolutePath}' (${moves.size} item(s) to move):\n$preview",
+                            PendingAction.ConfirmOrganize(moves)
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { addBotMessage("Couldn't plan the organization: ${e.message}") }
+            }
+        }
+    }
+
+    private fun requestOrganizePlan(dirPath: String, entries: List<String>): List<Pair<String, String>> {
+        val payload = JSONObject().apply {
+            put("model", _selectedModel.value)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply { put("role", "system"); put("content", ORGANIZE_SYSTEM_PROMPT) })
+                put(JSONObject().apply { put("role", "user"); put("content", "Folder: $dirPath\nItems:\n" + entries.joinToString("\n")) })
+            })
+        }
+        val body = payload.toString().toRequestBody("application/json".toMediaType())
+        val request = Request.Builder()
+            .url("https://openrouter.ai/api/v1/chat/completions")
+            .addHeader("Authorization", "Bearer ${_apiKey.value}")
+            .addHeader("Content-Type", "application/json")
+            .post(body)
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+            val bodyStr = response.body?.string() ?: throw IOException("Empty response")
+            val json = JSONObject(bodyStr)
+            val choices = json.optJSONArray("choices") ?: throw IOException("No choices in response")
+            if (choices.length() == 0) throw IOException("No choices in response")
+            val content = choices.getJSONObject(0).getJSONObject("message").getString("content")
+            val cleaned = content.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+            val arr = JSONArray(cleaned)
+            val moves = mutableListOf<Pair<String, String>>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val from = obj.optString("from", "")
+                val to = obj.optString("to", "")
+                if (from.isNotBlank() && to.isNotBlank() && from != to) {
+                    moves.add(from to to)
+                }
+            }
+            return moves
+        }
+    }
+
     companion object {
         private const val PREFS_NAME = "fileflow_prefs"
         private const val KEY_ONLINE_MODE = "online_mode_enabled"
@@ -542,13 +660,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private val SYSTEM_PROMPT = """
             You are the command interpreter for an Android file manager agent. Given a user's natural language request, decide which single action to take and reply with ONLY a raw JSON object — no markdown, no code fences, no explanation, nothing before or after it. Schema:
 
-            {"action": "list" | "read" | "delete" | "write" | "move" | "search" | "preview" | "chat", "target": "<path, relative to device storage root unless it starts with />", "content": "<only for write>", "dest": "<only for move, destination path>", "reply": "<only for chat, a short conversational reply>"}
+            {"action": "list" | "read" | "delete" | "write" | "move" | "search" | "preview" | "organize" | "chat", "target": "<path, relative to device storage root unless it starts with />", "content": "<only for write>", "dest": "<only for move, destination path>", "reply": "<only for chat, a short conversational reply>"}
 
             Rules:
+            - Use "organize" when the user wants a folder tidied up or sorted without specifying exact moves themselves (e.g. "organize my Downloads folder"). "target" is the folder to organize.
             - Use "chat" only when the request is not a file operation (greetings, questions about your capabilities, etc). Leave other fields empty in that case.
             - Never invent file contents for read/list/search/preview — leave "content" empty for those actions.
             - "target" and "dest" should be plain relative paths like "Download/notes.txt" unless the user gave an absolute path.
             - Respond with the JSON object and nothing else.
+        """.trimIndent()
+
+        private val ORGANIZE_SYSTEM_PROMPT = """
+            You help organize a folder on an Android device. You will be given a folder path and a flat list of its immediate contents (files and subfolders; subfolders end with /). Propose a tidy reorganization by grouping items into sensible subfolders — by type (Images, Documents, Videos, Audio, Archives, Apps) or another scheme that clearly fits the actual items you see.
+
+            Reply with ONLY a raw JSON array — no markdown, no commentary before or after it — of move operations:
+            [{"from": "<item name exactly as given, without trailing />", "to": "<new path relative to the same folder>"}]
+
+            Rules:
+            - Only include items that should move; omit items already well-placed.
+            - "from" must exactly match one of the given item names (minus any trailing /).
+            - "to" is always relative to the same folder (e.g. "Images/photo.jpg"), never absolute.
+            - Do not propose moving a folder into itself.
+            - If nothing needs reorganizing, reply with an empty array: []
         """.trimIndent()
     }
 
@@ -828,6 +961,7 @@ fun MessageBubble(message: ChatMessage, onAction: (PendingAction) -> Unit) {
                                     is PendingAction.ConfirmWrite -> "Confirm Write"
                                     is PendingAction.ConfirmMove -> "Confirm Move"
                                     is PendingAction.ConfirmUseTemplate -> "Confirm Apply Template"
+                                    is PendingAction.ConfirmOrganize -> "Confirm Organize (${message.action.moves.size} item${if (message.action.moves.size == 1) "" else "s"})"
                                 }
                             )
                         }
