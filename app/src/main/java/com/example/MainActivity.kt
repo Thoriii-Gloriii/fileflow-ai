@@ -211,11 +211,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- Online Mode: route the command through OpenRouter, fall back offline on any failure ---
+    // --- Online Mode: route the command through Gemini, fall back offline on any failure ---
     private fun processCommandOnline(text: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val raw = callOpenRouter(text)
+                val raw = callGemini(SYSTEM_PROMPT, text)
                 withContext(Dispatchers.Main) { dispatchOnlineAction(raw, text) }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -226,18 +226,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun callOpenRouter(userText: String): String {
+    private fun callGemini(systemPrompt: String, userText: String): String {
         val payload = JSONObject().apply {
-            put("model", _selectedModel.value)
-            put("messages", JSONArray().apply {
-                put(JSONObject().apply { put("role", "system"); put("content", SYSTEM_PROMPT) })
-                put(JSONObject().apply { put("role", "user"); put("content", userText) })
+            put("system_instruction", JSONObject().apply {
+                put("parts", JSONArray().apply { put(JSONObject().apply { put("text", systemPrompt) }) })
             })
+            put("contents", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("parts", JSONArray().apply { put(JSONObject().apply { put("text", userText) }) })
+                })
+            })
+            put("generationConfig", JSONObject().apply { put("responseMimeType", "application/json") })
         }
         val body = payload.toString().toRequestBody("application/json".toMediaType())
         val request = Request.Builder()
-            .url("https://openrouter.ai/api/v1/chat/completions")
-            .addHeader("Authorization", "Bearer ${_apiKey.value}")
+            .url("https://generativelanguage.googleapis.com/v1beta/models/${_selectedModel.value}:generateContent?key=${_apiKey.value}")
             .addHeader("Content-Type", "application/json")
             .post(body)
             .build()
@@ -248,9 +252,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             val bodyStr = response.body?.string() ?: throw IOException("Empty response")
             val json = JSONObject(bodyStr)
-            val choices = json.optJSONArray("choices") ?: throw IOException("No choices in response")
-            if (choices.length() == 0) throw IOException("No choices in response")
-            return choices.getJSONObject(0).getJSONObject("message").getString("content")
+            val candidates = json.optJSONArray("candidates") ?: throw IOException("No candidates in response")
+            if (candidates.length() == 0) throw IOException("No candidates in response")
+            val parts = candidates.getJSONObject(0).getJSONObject("content").getJSONArray("parts")
+            return parts.getJSONObject(0).getString("text")
         }
     }
 
@@ -571,7 +576,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // AI decides the organization scheme, so this only works in Online Mode.
     private fun executeOrganize(targetRaw: String) {
         if (!(_onlineModeEnabled.value && _apiKey.value.isNotBlank())) {
-            addBotMessage("Organizing needs Online Mode, since it's the AI that decides how to group things. Enable it and add an OpenRouter API key in Settings, then try again.")
+            addBotMessage("Organizing needs Online Mode, since it's the AI that decides how to group things. Enable it and add a Gemini API key in Settings, then try again.")
             return
         }
         val dir = if (targetRaw.isBlank()) File(rootPath) else resolveFile(targetRaw)
@@ -613,49 +618,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun requestOrganizePlan(dirPath: String, entries: List<String>): List<Pair<String, String>> {
-        val payload = JSONObject().apply {
-            put("model", _selectedModel.value)
-            put("messages", JSONArray().apply {
-                put(JSONObject().apply { put("role", "system"); put("content", ORGANIZE_SYSTEM_PROMPT) })
-                put(JSONObject().apply { put("role", "user"); put("content", "Folder: $dirPath\nItems:\n" + entries.joinToString("\n")) })
-            })
-        }
-        val body = payload.toString().toRequestBody("application/json".toMediaType())
-        val request = Request.Builder()
-            .url("https://openrouter.ai/api/v1/chat/completions")
-            .addHeader("Authorization", "Bearer ${_apiKey.value}")
-            .addHeader("Content-Type", "application/json")
-            .post(body)
-            .build()
-
-        httpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
-            val bodyStr = response.body?.string() ?: throw IOException("Empty response")
-            val json = JSONObject(bodyStr)
-            val choices = json.optJSONArray("choices") ?: throw IOException("No choices in response")
-            if (choices.length() == 0) throw IOException("No choices in response")
-            val content = choices.getJSONObject(0).getJSONObject("message").getString("content")
-            val cleaned = content.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
-            val arr = JSONArray(cleaned)
-            val moves = mutableListOf<Pair<String, String>>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val from = obj.optString("from", "")
-                val to = obj.optString("to", "")
-                if (from.isNotBlank() && to.isNotBlank() && from != to) {
-                    moves.add(from to to)
-                }
+        val userText = "Folder: $dirPath\nItems:\n" + entries.joinToString("\n")
+        val content = callGemini(ORGANIZE_SYSTEM_PROMPT, userText)
+        val cleaned = content.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+        val arr = JSONArray(cleaned)
+        val moves = mutableListOf<Pair<String, String>>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.getJSONObject(i)
+            val from = obj.optString("from", "")
+            val to = obj.optString("to", "")
+            if (from.isNotBlank() && to.isNotBlank() && from != to) {
+                moves.add(from to to)
             }
-            return moves
         }
+        return moves
     }
 
     companion object {
         private const val PREFS_NAME = "fileflow_prefs"
         private const val KEY_ONLINE_MODE = "online_mode_enabled"
-        private const val KEY_API_KEY = "openrouter_api_key"
-        private const val KEY_MODEL = "openrouter_model"
-        const val DEFAULT_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+        private const val KEY_API_KEY = "gemini_api_key"
+        private const val KEY_MODEL = "gemini_model"
+        const val DEFAULT_MODEL = "gemini-flash-latest"
 
         private val SYSTEM_PROMPT = """
             You are the command interpreter for an Android file manager agent. Given a user's natural language request, decide which single action to take and reply with ONLY a raw JSON object — no markdown, no code fences, no explanation, nothing before or after it. Schema:
@@ -836,21 +820,21 @@ fun SettingsDialog(viewModel: ChatViewModel, onDismiss: () -> Unit) {
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Route commands through OpenRouter")
+                    Text("Route commands through Gemini")
                     Switch(checked = enabled, onCheckedChange = { enabled = it })
                 }
 
                 if (enabled) {
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
-                        text = "Requires an OpenRouter API key. Get one at openrouter.ai/keys.",
+                        text = "Requires a Gemini API key. Get one at aistudio.google.com/apikey (free tier available).",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
                         value = keyInput,
                         onValueChange = { keyInput = it },
-                        label = { Text("OpenRouter API key") },
+                        label = { Text("Gemini API key") },
                         singleLine = true,
                         visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
                         trailingIcon = {
