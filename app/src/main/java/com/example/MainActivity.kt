@@ -160,7 +160,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _messages = MutableStateFlow<List<ChatMessage>>(
         listOf(
             ChatMessage(
-                text = "Hello! I am your file manager agent. I can list, read, write, move, and delete files based on simple commands. How can I help you organize your device today?\n\nExamples:\n- \"List files in Download\"\n- \"Write 'hello' to Download/test.txt\"\n- \"Delete Download/test.txt\"\n- \"Move Download/test.txt to Download/Docs/test.txt\"",
+                text = "Hello! I am your file manager agent. I can list, read, write, move, and delete files based on simple commands. How can I help you organize your device today?\n\nExamples:\n- \"List files in Download\"\n- \"Write 'hello' to Download/test.txt\"\n- \"Delete Download/test.txt\"\n- \"Move Download/test.txt to Download/Docs/test.txt\"\n- \"Organize Download\"\n- \"Group .pdf .docx into Docs\"",
                 isUser = false
             )
         )
@@ -272,6 +272,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 "preview" -> executePreview(obj.optString("target", ""))
                 "search" -> executeSearch(obj.optString("target", ""))
                 "organize" -> executeOrganize(obj.optString("target", ""))
+                "group_files_by_type" -> {
+                    val extensions = obj.optJSONArray("extensions")?.let { arr ->
+                        (0 until arr.length()).map { arr.getString(it) }
+                    } ?: emptyList()
+                    executeGroupByType(
+                        obj.optString("target", ""),
+                        extensions,
+                        obj.optString("folder_name", "Grouped")
+                    )
+                }
                 "delete" -> {
                     val file = resolveFile(obj.optString("target", ""))
                     addBotMessage("Are you sure you want to delete '${file.absolutePath}'?", PendingAction.ConfirmDelete(file.absolutePath))
@@ -385,7 +395,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            // Organize Logic (requires Online Mode - see executeOrganize)
+            // Group-by-type Logic: "group .pdf .docx into Docs", "move .apk files to APKs"
+            GROUP_BY_TYPE_REGEX.find(input)?.let { m ->
+                val rawExts = m.groupValues[2]
+                val exts = EXT_TOKEN_REGEX.findAll(rawExts)
+                    .map { it.value }
+                    .filter { it.length > 1 && !it.equals(".files", ignoreCase = true) }
+                    .toList()
+                val folder = m.groupValues[3].trim().replaceFirstChar { it.uppercase() }
+                if (exts.isNotEmpty() && folder.isNotBlank()) {
+                    executeGroupByType("", exts, folder)
+                    return
+                }
+            }
+
+            // Organize Logic (AI-planned in Online Mode, EXT_MAP-based offline)
             if (lower.contains("organize") || lower.contains("organise") || lower.contains("tidy")) {
                 val target = quotes.firstOrNull() ?: words.find { it.contains("/") } ?: ""
                 executeOrganize(target)
@@ -408,7 +432,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
-            addBotMessage("I didn't quite understand that. ${if (_onlineModeEnabled.value) "Online Mode is on but couldn't map that to an action." else "To ensure offline capabilities, I use a fast rule-based parser."} Try commands like:\n- List files in 'Download'\n- Read 'Download/note.txt'\n- Delete 'Download/old_folder'\n- Write 'hello' to 'Download/note.txt'\n- Move 'Download/A.txt' to 'Download/B.txt'\n- Preview 'Download/image.png'\n- Search for 'query'\n- Organize 'Download' (needs Online Mode)\n- Create template 'name' from 'path'\n- Use template 'name' at 'path'")
+            addBotMessage("I didn't quite understand that. ${if (_onlineModeEnabled.value) "Online Mode is on but couldn't map that to an action." else "To ensure offline capabilities, I use a fast rule-based parser."} Try commands like:\n- List files in 'Download'\n- Read 'Download/note.txt'\n- Delete 'Download/old_folder'\n- Write 'hello' to 'Download/note.txt'\n- Move 'Download/A.txt' to 'Download/B.txt'\n- Preview 'Download/image.png'\n- Search for 'query'\n- Organize 'Download'\n- Group .pdf .docx into 'Docs'\n- Create template 'name' from 'path'\n- Use template 'name' at 'path'")
         } catch (e: Exception) {
             addBotMessage("Failed to parse or execute command: ${e.message}")
         }
@@ -520,7 +544,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val dir = if (targetRaw.isBlank()) File(rootPath) else resolveFile(targetRaw)
         if (dir.exists() && dir.isDirectory) {
             val files = dir.listFiles()
-            val listStr = files?.joinToString("\n") { (if (it.isDirectory) "📁 " else "📄 ") + it.name } ?: "Empty or cannot read."
+            val listStr = files?.joinToString("\n") { (if (it.isDirectory) "\uD83D\uDCC1 " else "\uD83D\uDCC4 ") + it.name } ?: "Empty or cannot read."
             addBotMessage("Contents of ${dir.absolutePath}:\n$listStr")
         } else {
             addBotMessage("Directory '${dir.absolutePath}' not found.")
@@ -573,48 +597,111 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // AI decides the organization scheme, so this only works in Online Mode.
+    // Organize a folder. In Online Mode (with an API key) Gemini proposes a custom grouping
+    // scheme. Otherwise this falls back to a deterministic, offline EXT_MAP-based sort — no
+    // network or API key required.
     private fun executeOrganize(targetRaw: String) {
-        if (!(_onlineModeEnabled.value && _apiKey.value.isNotBlank())) {
-            addBotMessage("Organizing needs Online Mode, since it's the AI that decides how to group things. Enable it and add a Gemini API key in Settings, then try again.")
-            return
-        }
         val dir = if (targetRaw.isBlank()) File(rootPath) else resolveFile(targetRaw)
         if (!dir.exists() || !dir.isDirectory) {
             addBotMessage("Directory '${dir.absolutePath}' not found.")
             return
         }
-        addBotMessage("Looking at '${dir.absolutePath}' to plan an organization...")
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val entries = dir.listFiles()?.map { it.name + if (it.isDirectory) "/" else "" } ?: emptyList()
-                if (entries.isEmpty()) {
-                    withContext(Dispatchers.Main) { addBotMessage("That folder is empty - nothing to organize.") }
-                    return@launch
-                }
-                val relativeMoves = requestOrganizePlan(dir.absolutePath, entries)
-                // Validate against what's actually on disk, in case the model named something that doesn't exist.
-                val moves = relativeMoves.mapNotNull { (relFrom, relTo) ->
-                    val fromFile = File(dir, relFrom)
-                    if (!fromFile.exists()) return@mapNotNull null
-                    val toFile = File(dir, relTo)
-                    OrganizeMove(fromFile.absolutePath, toFile.absolutePath)
-                }
-                withContext(Dispatchers.Main) {
-                    if (moves.isEmpty()) {
-                        addBotMessage("The organizer didn't suggest any changes - looks tidy already.")
-                    } else {
-                        val preview = moves.joinToString("\n") { "${File(it.from).name} -> ${it.to.removePrefix(dir.absolutePath + "/")}" }
-                        addBotMessage(
-                            "Here's a suggested organization for '${dir.absolutePath}' (${moves.size} item(s) to move):\n$preview",
-                            PendingAction.ConfirmOrganize(moves)
-                        )
+
+        if (_onlineModeEnabled.value && _apiKey.value.isNotBlank()) {
+            addBotMessage("Looking at '${dir.absolutePath}' to plan an organization...")
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val entries = dir.listFiles()?.map { it.name + if (it.isDirectory) "/" else "" } ?: emptyList()
+                    if (entries.isEmpty()) {
+                        withContext(Dispatchers.Main) { addBotMessage("That folder is empty - nothing to organize.") }
+                        return@launch
+                    }
+                    val relativeMoves = requestOrganizePlan(dir.absolutePath, entries)
+                    // Validate against what's actually on disk, in case the model named something that doesn't exist.
+                    val moves = relativeMoves.mapNotNull { (relFrom, relTo) ->
+                        val fromFile = File(dir, relFrom)
+                        if (!fromFile.exists()) return@mapNotNull null
+                        val toFile = File(dir, relTo)
+                        OrganizeMove(fromFile.absolutePath, toFile.absolutePath)
+                    }
+                    withContext(Dispatchers.Main) {
+                        offerOrganizeMoves(dir, moves, "The organizer didn't suggest any changes - looks tidy already.")
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        addBotMessage("Couldn't reach Gemini for an organize plan (${e.message ?: "unknown error"}). Falling back to offline sorting by file type.")
+                        val moves = computeOfflineOrganizeMoves(dir)
+                        offerOrganizeMoves(dir, moves, "Nothing to move - everything's already sorted by type.")
                     }
                 }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) { addBotMessage("Couldn't plan the organization: ${e.message}") }
+            }
+        } else {
+            val moves = computeOfflineOrganizeMoves(dir)
+            offerOrganizeMoves(dir, moves, "Nothing to move - everything's already sorted by type.")
+        }
+    }
+
+    // Deterministic offline sort: buckets files in `dir` into Images / Videos / Documents /
+    // Audio / Archives / Other subfolders by extension. No AI, no network needed.
+    private fun computeOfflineOrganizeMoves(dir: File): List<OrganizeMove> {
+        val moves = mutableListOf<OrganizeMove>()
+        dir.listFiles()?.forEach { file ->
+            if (file.isDirectory) return@forEach
+            val ext = file.extension.lowercase()
+            val category = EXT_MAP.entries.firstOrNull { ext in it.value }?.key ?: "Other"
+            // Skip files that are already sitting in their target category subfolder.
+            if (file.parentFile?.name == category) return@forEach
+            val dest = File(File(dir, category), file.name)
+            moves.add(OrganizeMove(file.absolutePath, dest.absolutePath))
+        }
+        return moves
+    }
+
+    // "group .pdf .docx into Docs" / online action group_files_by_type: moves files matching
+    // a given extension list into a single named subfolder, without touching anything else.
+    private fun executeGroupByType(targetRaw: String, extensionsRaw: List<String>, folderNameRaw: String) {
+        val dir = if (targetRaw.isBlank()) File(rootPath) else resolveFile(targetRaw)
+        if (!dir.exists() || !dir.isDirectory) {
+            addBotMessage("Directory '${dir.absolutePath}' not found.")
+            return
+        }
+        val normExts = extensionsRaw
+            .map { it.trim().lowercase().removePrefix(".") }
+            .filter { it.isNotBlank() }
+            .toSet()
+        if (normExts.isEmpty()) {
+            addBotMessage("Please specify which file extensions to group, e.g. \"Group .pdf .docx into Docs\".")
+            return
+        }
+        // Guard against path traversal - only ever use the leaf name as the subfolder.
+        val safeName = File(folderNameRaw.ifBlank { "Grouped" }).name.ifEmpty { "Grouped" }
+        val moves = mutableListOf<OrganizeMove>()
+        dir.listFiles()?.forEach { file ->
+            if (file.isDirectory) return@forEach
+            if (file.extension.lowercase() in normExts) {
+                if (file.parentFile?.name == safeName) return@forEach
+                val dest = File(File(dir, safeName), file.name)
+                moves.add(OrganizeMove(file.absolutePath, dest.absolutePath))
             }
         }
+        val extList = normExts.joinToString(", ") { ".$it" }
+        offerOrganizeMoves(dir, moves, "No files matching $extList found in ${dir.name}.")
+    }
+
+    // Shared confirmation preview for any batch of proposed moves (offline organize, online
+    // organize, and group-by-type all funnel through here).
+    private fun offerOrganizeMoves(dir: File, moves: List<OrganizeMove>, emptyMessage: String) {
+        if (moves.isEmpty()) {
+            addBotMessage(emptyMessage)
+            return
+        }
+        val preview = moves.joinToString("\n") {
+            "${File(it.from).name} -> ${it.to.removePrefix(dir.absolutePath + "/")}"
+        }
+        addBotMessage(
+            "Here's a suggested organization for '${dir.absolutePath}' (${moves.size} item(s) to move):\n$preview",
+            PendingAction.ConfirmOrganize(moves)
+        )
     }
 
     private fun requestOrganizePlan(dirPath: String, entries: List<String>): List<Pair<String, String>> {
@@ -641,13 +728,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private const val KEY_MODEL = "gemini_model"
         const val DEFAULT_MODEL = "gemini-flash-latest"
 
+        // Offline, no-API-key extension -> category map used by executeOrganize's fallback
+        // path and available generally for deterministic file-type sorting.
+        private val EXT_MAP: Map<String, Set<String>> = mapOf(
+            "Images" to setOf("jpg", "jpeg", "png", "gif", "webp", "heic", "bmp"),
+            "Videos" to setOf("mp4", "mkv", "mov", "avi", "webm", "3gp"),
+            "Documents" to setOf("pdf", "doc", "docx", "txt", "xlsx", "pptx", "csv"),
+            "Audio" to setOf("mp3", "wav", "m4a", "ogg", "opus"),
+            "Archives" to setOf("zip", "rar", "7z", "tar", "gz")
+        )
+
+        // Matches things like: "group .pdf .docx into Docs", "move apk files to APKs",
+        // "gather .png, .jpg into Photos"
+        val GROUP_BY_TYPE_REGEX = Regex(
+            """(group|move|sort|gather|put)\s+((?:\.?\w+[\s,]*)+?)\s+(?:files?\s+)?(?:in(?:to)?|to)\s+(\w[\w\- ]*)""",
+            RegexOption.IGNORE_CASE
+        )
+        val EXT_TOKEN_REGEX = Regex("""\.?\w+""")
+
         private val SYSTEM_PROMPT = """
             You are the command interpreter for an Android file manager agent. Given a user's natural language request, decide which single action to take and reply with ONLY a raw JSON object — no markdown, no code fences, no explanation, nothing before or after it. Schema:
 
-            {"action": "list" | "read" | "delete" | "write" | "move" | "search" | "preview" | "organize" | "chat", "target": "<path, relative to device storage root unless it starts with />", "content": "<only for write>", "dest": "<only for move, destination path>", "reply": "<only for chat, a short conversational reply>"}
+            {"action": "list" | "read" | "delete" | "write" | "move" | "search" | "preview" | "organize" | "group_files_by_type" | "chat", "target": "<path, relative to device storage root unless it starts with />", "content": "<only for write>", "dest": "<only for move, destination path>", "extensions": ["<only for group_files_by_type, e.g. \"pdf\", \"docx\">"], "folder_name": "<only for group_files_by_type, the subfolder to group matching files into>", "reply": "<only for chat, a short conversational reply>"}
 
             Rules:
-            - Use "organize" when the user wants a folder tidied up or sorted without specifying exact moves themselves (e.g. "organize my Downloads folder"). "target" is the folder to organize.
+            - Use "organize" when the user wants a folder tidied up generally, without specifying exact file types themselves (e.g. "organize my Downloads folder"). "target" is the folder to organize.
+            - Use "group_files_by_type" when the user names specific file extensions and a destination subfolder (e.g. "group my pdfs and docs into Documents", "move all .apk files into APKs"). "target" is the folder to scan, "extensions" is the list of extensions (without dots), "folder_name" is the subfolder name to move them into.
             - Use "chat" only when the request is not a file operation (greetings, questions about your capabilities, etc). Leave other fields empty in that case.
             - Never invent file contents for read/list/search/preview — leave "content" empty for those actions.
             - "target" and "dest" should be plain relative paths like "Download/notes.txt" unless the user gave an absolute path.
