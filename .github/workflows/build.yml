@@ -39,7 +39,16 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: |
+          set +e
+          ./gradlew assembleDebug --stacktrace > build.log 2>&1
+          code=$?
+          tail -n 5 build.log
+          if [ $code -ne 0 ]; then
+            msg=$(grep -E "^e: |error:|What went wrong|AAPT|Execution failed|Caused by" -A2 build.log | head -40 | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=Gradle build errors::$msg"
+          fi
+          exit $code
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4

@@ -36,6 +36,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -109,6 +110,12 @@ fun PermissionWrapper(content: @Composable () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
+            Image(
+                painter = painterResource(R.drawable.logo_mark),
+                contentDescription = "Local File Agent logo",
+                modifier = Modifier.size(120.dp)
+            )
+            Spacer(modifier = Modifier.height(16.dp))
             Text(
                 text = "Storage Permission Required",
                 style = MaterialTheme.typography.headlineSmall,
@@ -816,12 +823,20 @@ fun ChatScreen(viewModel: ChatViewModel = viewModel()) {
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
-                        Text("Local File Agent")
-                        Text(
-                            text = if (onlineModeEnabled && apiKey.isNotBlank()) "Online" else "Offline",
-                            style = MaterialTheme.typography.labelSmall
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Image(
+                            painter = painterResource(R.drawable.logo_mark),
+                            contentDescription = "Local File Agent logo",
+                            modifier = Modifier.size(36.dp)
                         )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text("Local File Agent")
+                            Text(
+                                text = if (onlineModeEnabled && apiKey.isNotBlank()) "Online" else "Offline",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
                     }
                 },
                 actions = {
@@ -1005,8 +1020,18 @@ fun MessageBubble(message: ChatMessage, onAction: (PendingAction) -> Unit) {
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = alignment
     ) {
+        Row(verticalAlignment = Alignment.Top) {
+            if (!isUser) {
+                Image(
+                    painter = painterResource(R.drawable.logo_mark),
+                    contentDescription = "Local File Agent",
+                    modifier = Modifier.size(32.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            }
         Box(
             modifier = Modifier
+                .weight(1f, fill = false)
                 .background(bgColor, shape)
                 .padding(16.dp)
         ) {
@@ -1058,6 +1083,7 @@ fun MessageBubble(message: ChatMessage, onAction: (PendingAction) -> Unit) {
                     }
                 }
             }
+        }
         }
     }
 }
